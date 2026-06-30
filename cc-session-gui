@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""
+cc-session-gui — graphical global session manager (session.txt family).
+
+Lists every coding-agent session across every repo (Claude Code, Codex,
+opencode, pi) with:
+  - when it was last used (relative)
+  - tool · repo (cwd basename) + git branch
+  - first prompt / title as a preview
+
+Double-click / Enter on a row opens your terminal IN that repo's directory and
+relaunches the session with the right resume command. Solves "which repo / which
+tool was I in?" after a reboot. Pure stdlib (tkinter ships with python).
+"""
+
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from tkinter import ttk
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import ccsessions as ccs  # noqa: E402
+
+
+# ---------------------------------------------------------------- terminal launch
+def detect_terminal():
+    """Return (name, builder). builder(cwd, cmd_list) -> full argv."""
+    env = os.environ.get("TERMINAL")
+    order = ([env] if env else []) + [
+        "alacritty", "kitty", "wezterm", "foot", "gnome-terminal", "konsole", "xterm",
+    ]
+    for t in order:
+        if not t:
+            continue
+        path = shutil.which(t)
+        if not path:
+            continue
+        name = os.path.basename(t)
+
+        def builder(cwd, cmd, _name=name, _path=path):
+            if _name in ("alacritty", "kitty"):
+                return [_path, "--working-directory", cwd, "-e", *cmd]
+            if _name == "wezterm":
+                return [_path, "start", "--cwd", cwd, "--", *cmd]
+            if _name == "foot":
+                return [_path, "--working-directory", cwd, *cmd]
+            if _name == "gnome-terminal":
+                return [_path, f"--working-directory={cwd}", "--", *cmd]
+            if _name == "konsole":
+                return [_path, "--workdir", cwd, "-e", *cmd]
+            return [_path, "-e", *cmd]  # xterm fallback
+
+        return name, builder
+    return None, None
+
+
+TERM_NAME, TERM_BUILD = detect_terminal()
+
+
+def launch(session):
+    cwd = session["cwd"]
+    if not os.path.isdir(cwd):
+        return f"cwd missing: {cwd}"
+    if not TERM_BUILD:
+        return "no terminal emulator found"
+    sh = os.environ.get("SHELL", "/bin/bash")
+    resume = " ".join(shlex.quote(a) for a in ccs.resume_argv(session))
+    # run the agent, then drop into an interactive shell in the same dir so
+    # quitting the agent (Ctrl-C) does NOT close the terminal window.
+    inner = f"{resume}; exec {shlex.quote(sh)}"
+    try:
+        subprocess.Popen(
+            TERM_BUILD(cwd, [sh, "-c", inner]), cwd=cwd,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return None
+    except Exception as e:  # noqa
+        return str(e)
+
+
+# ---------------------------------------------------------------- GUI
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.sessions = []
+        self.filtered = []
+        root.title("Claude Code — Session Manager")
+        root.geometry("1180x650")
+
+        top = ttk.Frame(root, padding=8)
+        top.pack(fill="x")
+        ttk.Label(top, text="Search:").pack(side="left")
+        self.q = tk.StringVar()
+        self.q.trace_add("write", lambda *_: self.refilter())
+        e = ttk.Entry(top, textvariable=self.q)
+        e.pack(side="left", fill="x", expand=True, padx=6)
+        e.focus_set()
+        ttk.Button(top, text="Rescan", command=self.rescan).pack(side="left")
+
+        cols = ("when", "tool", "repo", "branch", "prompt")
+        self.tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="browse")
+        for c, w, t in [("when", 90, "When"), ("tool", 90, "Tool"),
+                        ("repo", 190, "Repo"), ("branch", 120, "Branch"),
+                        ("prompt", 600, "First prompt")]:
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        vs = ttk.Scrollbar(root, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vs.set)
+        vs.place(in_=self.tree, relx=1.0, rely=0, relheight=1.0, anchor="ne")
+
+        self.tree.bind("<Double-1>", lambda _: self.resume())
+        self.tree.bind("<Return>", lambda _: self.resume())
+
+        self.status = tk.StringVar(value="scanning…")
+        bar = ttk.Frame(root, padding=(8, 4))
+        bar.pack(fill="x")
+        ttk.Label(bar, textvariable=self.status).pack(side="left")
+        ttk.Button(bar, text="Resume in terminal  ↵", command=self.resume).pack(side="right")
+        ttk.Button(bar, text="Copy path", command=self.copy_path).pack(side="right", padx=6)
+
+        self.rescan()
+
+    def rescan(self):
+        self.status.set("scanning…")
+        threading.Thread(target=self._scan_worker, daemon=True).start()
+
+    def _scan_worker(self):
+        data = ccs.scan_all()
+        self.root.after(0, lambda: self._scan_done(data))
+
+    def _scan_done(self, data):
+        self.sessions = data
+        self.refilter()
+
+    def refilter(self):
+        q = self.q.get().lower().strip()
+        self.filtered = [
+            s for s in self.sessions
+            if not q or q in s["repo"].lower() or q in s["branch"].lower()
+            or q in s["prompt"].lower() or q in s["cwd"].lower() or q in s["tool"].lower()
+        ]
+        self.tree.delete(*self.tree.get_children())
+        for i, s in enumerate(self.filtered):
+            tag = "even" if i % 2 == 0 else "odd"
+            self.tree.insert("", "end", iid=str(i), tags=(tag,),
+                             values=(ccs.rel_time(s["mtime"]), s["tool"],
+                                     s["repo"], s["branch"], s["prompt"]))
+        term = TERM_NAME or "NO TERMINAL"
+        self.status.set(f"{len(self.filtered)}/{len(self.sessions)} sessions · launches via {term}")
+
+    def _sel(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return self.filtered[int(sel[0])]
+
+    def resume(self):
+        s = self._sel()
+        if not s:
+            self.status.set("select a session first")
+            return
+        err = launch(s)
+        if err:
+            self.status.set("ERROR: " + err)
+        else:
+            self.status.set(f"resuming {s['tool']} · {s['repo']} ({s['branch']}) → {s['cwd']}")
+
+    def copy_path(self):
+        s = self._sel()
+        if not s:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(s["cwd"])
+        self.status.set("copied: " + s["cwd"])
+
+
+# ---------------------------------------------------------------- dark theme
+BG = "#0b0b0d"
+SURFACE = "#141417"
+SURFACE2 = "#1c1c21"
+TEXT = "#e8e8ea"
+MUTED = "#8a8a92"
+ACCENT = "#cc6b4a"
+SEL = "#2a2a31"
+
+
+def setup_dark(root):
+    root.configure(bg=BG)
+    s = ttk.Style()
+    try:
+        s.theme_use("clam")
+    except Exception:  # noqa
+        pass
+    s.configure(".", background=BG, foreground=TEXT, fieldbackground=SURFACE,
+                bordercolor=BG, lightcolor=BG, darkcolor=BG)
+    s.configure("TFrame", background=BG)
+    s.configure("TLabel", background=BG, foreground=MUTED)
+    s.configure("TEntry", fieldbackground=SURFACE, foreground=TEXT,
+                insertcolor=TEXT, bordercolor=SURFACE2)
+    s.map("TEntry", fieldbackground=[("focus", SURFACE)])
+    s.configure("TButton", background=SURFACE2, foreground=TEXT,
+                bordercolor=SURFACE2, focuscolor=ACCENT, padding=6)
+    s.map("TButton",
+          background=[("active", SEL), ("pressed", ACCENT)],
+          foreground=[("pressed", "#000000")])
+    s.configure("Treeview", background=SURFACE, fieldbackground=SURFACE,
+                foreground=TEXT, rowheight=26, borderwidth=0)
+    s.map("Treeview",
+          background=[("selected", ACCENT)],
+          foreground=[("selected", "#000000")])
+    s.configure("Treeview.Heading", background=SURFACE2, foreground=MUTED,
+                relief="flat", padding=6)
+    s.map("Treeview.Heading", background=[("active", SEL)])
+    s.configure("Vertical.TScrollbar", background=SURFACE2, troughcolor=BG,
+                bordercolor=BG, arrowcolor=MUTED)
+
+
+def main():
+    root = tk.Tk()
+    setup_dark(root)
+    app = App(root)
+    app.tree.tag_configure("odd", background=SURFACE)
+    app.tree.tag_configure("even", background="#101013")
+    app.refilter()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

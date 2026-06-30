@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Code Sessions
+Comment=Resume any coding-agent session in the right repo
+Exec=__BIN__/cc-session-gui
+Icon=__ICON__
+Terminal=false
+Categories=Development;
+Keywords=claude;codex;opencode;pi;session;resume;repo;
+StartupNotify=false

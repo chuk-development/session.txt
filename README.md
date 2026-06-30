@@ -64,6 +64,28 @@ resume N show   # just print the full command for entry N (don't run it)
 
 `resume` runs whatever the line says, so it resumes Claude *and* Codex sessions transparently. On every run it also **self-cleans**: any entry whose session no longer exists on disk is dropped from `session.txt`.
 
+## Global picker — across every repo
+
+`resume` is per-folder. When you can't remember *which* folder (or which tool) a session was in, two global pickers list **every** session on your machine and relaunch it in the right directory with the right resume command:
+
+```bash
+ccs              # fuzzy picker (fzf) over every repo + tool
+ccs whoop        # pre-filter by repo / branch / prompt / tool
+ccs -t codex     # restrict to one tool
+```
+
+```text
+ just now  claude    session.txt   main    Wire up the global picker
+   3m ago  codex     besser-bahn   -       Refactor renderer
+  13m ago  opencode  marketing     -       Build the API
+```
+
+Pick a row, hit enter — `ccs` `cd`s into that repo and execs the agent's resume command, so on exit you're back in your shell. Needs [`fzf`](https://github.com/junegunn/fzf) for the fuzzy UI (falls back to a numbered menu without it).
+
+Prefer a GUI? The installer also adds **Claude Code Sessions** to your app launcher — the same list as a searchable dark-mode window; double-click a row to open your terminal in that repo and resume.
+
+Both pickers share one scanner (`ccsessions.py`) that reads each tool's native store directly, so they always cover the same agents `resume` does: **Claude Code, Codex, opencode, pi**. (cursor-agent stores sessions under `md5(cwd)` with no recoverable path, so those stay per-folder — run `resume` in the folder.)
+
 ## Supported clients
 
 | Client | Resume command logged | How it's captured | Title |
@@ -95,12 +117,18 @@ Everything feeds the same writer (`session-log.sh`), which writes `<cwd>/session
 | `session-log.sh` | `~/.claude/hooks/session-log.sh` |
 | `agent-wrappers.sh` | `~/.claude/hooks/agent-wrappers.sh` |
 | `resume` | `~/.local/bin/resume` |
+| `ccs` | `~/.local/bin/ccs` |
+| `cc-session-gui` | `~/.local/bin/cc-session-gui` |
+| `ccsessions.py` | `~/.local/bin/ccsessions.py` (shared scanner) |
+| `cc-session-gui.svg` | `~/.local/share/icons/` |
+| `cc-session-gui.desktop` | `~/.local/share/applications/` |
 
 ## Testing
 
 ```bash
-bash test/test.sh   # deterministic unit/integration suite (no network)
-bash test/e2e.sh    # live: runs each installed CLI headless, then checks logging
+bash test/test.sh        # deterministic writer/resume suite (no network)
+python3 test/test_scan.py # scanner suite: fake stores for all 4 tools (no network)
+bash test/e2e.sh         # live: runs each installed CLI headless, then checks logging
 ```
 
 `test/test.sh` drives the writer and `resume` against fake session stores under a

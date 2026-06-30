@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""
+ccs — global session picker, CLI version (part of the session.txt family).
+
+Lists every coding-agent session across every repo (Claude Code, Codex,
+opencode, pi), picks one with fzf (falls back to a numbered menu), then
+relaunches it with the right resume command in that repo's directory. After the
+agent exits you're back in your normal shell.
+
+Usage:
+    ccs              # interactive picker, all tools
+    ccs <query>      # pre-filter fzf with a query (repo / branch / prompt / tool)
+    ccs -t codex     # restrict to one tool (claude|codex|opencode|pi)
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import ccsessions as ccs  # noqa: E402
+
+# ---- ANSI (no deps) ----
+A = "\033[38;5;173m"  # claude orange
+D = "\033[2m"
+R = "\033[0m"
+
+# per-tool tag colour so the source agent is obvious at a glance
+TOOL_COLOR = {
+    "claude": "\033[38;5;173m",   # orange
+    "codex": "\033[38;5;78m",     # green
+    "opencode": "\033[38;5;75m",  # blue
+    "pi": "\033[38;5;176m",       # purple
+}
+
+
+def parse_args(argv):
+    tool = None
+    terms = []
+    it = iter(argv)
+    for a in it:
+        if a in ("-t", "--tool"):
+            tool = next(it, None)
+        elif a.startswith("--tool="):
+            tool = a.split("=", 1)[1]
+        else:
+            terms.append(a)
+    tools = [tool] if tool in ccs.TOOLS else None
+    return " ".join(terms).strip(), tools
+
+
+def fmt_row(s):
+    tcol = TOOL_COLOR.get(s["tool"], "")
+    return (f"{A}{ccs.rel_time(s['mtime']):>9}{R}  "
+            f"{tcol}{s['tool'][:8]:8}{R}  "
+            f"{s['repo'][:22]:22}  "
+            f"{D}{s['branch'][:14]:14}{R}  "
+            f"{s['prompt'][:64]}")
+
+
+def pick_fzf(sessions, query):
+    lines = [f"{i}\t{fmt_row(s)}" for i, s in enumerate(sessions)]
+    args = [
+        "fzf", "--ansi", "--with-nth=2..", "--delimiter=\t",
+        "--height=90%", "--reverse", "--no-hscroll",
+        "--prompt=resume › ",
+        "--header=enter=resume · ctrl-c=cancel",
+    ]
+    if query:
+        args += ["--query", query]
+    try:
+        p = subprocess.run(args, input="\n".join(lines),
+                           stdout=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        return None
+    if p.returncode != 0 or not p.stdout.strip():
+        return None
+    idx = p.stdout.split("\t", 1)[0].strip()
+    try:
+        return sessions[int(idx)]
+    except (ValueError, IndexError):
+        return None
+
+
+def pick_menu(sessions, query):
+    rows = sessions
+    if query:
+        q = query.lower()
+        rows = [s for s in sessions if q in s["repo"].lower()
+                or q in s["branch"].lower() or q in s["prompt"].lower()
+                or q in s["tool"].lower()]
+    rows = rows[:40]
+    if not rows:
+        print("no matching sessions")
+        return None
+    for i, s in enumerate(rows):
+        print(f"{A}{i:2}{R}  {fmt_row(s)}")
+    try:
+        sel = input(f"\n{A}#{R} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not sel.isdigit() or int(sel) >= len(rows):
+        return None
+    return rows[int(sel)]
+
+
+def main():
+    query, tools = parse_args(sys.argv[1:])
+    sessions = ccs.scan_all(tools)
+    if not sessions:
+        print("no sessions found", file=sys.stderr)
+        sys.exit(1)
+    picker = pick_fzf if shutil.which("fzf") else pick_menu
+    s = picker(sessions, query)
+    if not s:
+        sys.exit(0)
+    if not os.path.isdir(s["cwd"]):
+        print(f"cwd missing: {s['cwd']}", file=sys.stderr)
+        sys.exit(1)
+    argv = ccs.resume_argv(s)
+    print(f"{A}→{R} {s['tool']} · {s['repo']} {D}({s['branch']}){R}  {s['cwd']}")
+    os.chdir(s["cwd"])
+    # replace this process with the agent; on exit you're back in your shell
+    os.execvp(argv[0], argv)
+
+
+if __name__ == "__main__":
+    main()
